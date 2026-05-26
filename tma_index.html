@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Семейный бюджет</title>
+
+<!-- Telegram Mini App SDK -->
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+<!-- Firebase -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, set, get, onValue, remove } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+  // ============================================================
+  // ВСТАВЬТЕ СЮДА ВАШ FIREBASE CONFIG (шаг 3 инструкции)
+  // ============================================================
+  const firebaseConfig = {
+      apiKey: "AIzaSyBUc-IrIpVuwaqiSQCzCaWJQEzqh3Z0kLU",
+      authDomain: "family-budget-a8df6.firebaseapp.com",
+      databaseURL: "https://family-budget-a8df6-default-rtdb.europe-west1.firebasedatabase.app",
+      projectId: "family-budget-a8df6",
+      storageBucket: "family-budget-a8df6.firebasestorage.app",
+      messagingSenderId: "325781999205",
+      appId: "1:325781999205:web:2d79506236601027d3008c"
+    };
+  // ============================================================
+
+  const app = initializeApp(firebaseConfig);
+  const db = getDatabase(app);
+
+  // ============================================================
+  // ВСТАВЬТЕ СЮДА ID СЕМЕЙНОЙ ГРУППЫ (любая строка, общая для всех)
+  // Например: "ivanov_family" — все, кто откроет приложение с этим ID, видят общие данные
+  // ============================================================
+  const GROUP_ID = "aniohev_id";
+  // ============================================================
+
+  const tg = window.Telegram.WebApp;
+  tg.ready();
+  tg.expand();
+
+  const MONTHS_RU = ['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
+  const DAYS_RU = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];
+  const DEFAULT_CATS = {
+    expense: ['Еда','Транспорт','ЖКХ','Здоровье','Развлечения','Одежда','Другое'],
+    income:  ['Зарплата','Аванс','Подработка','Другое']
+  };
+
+  let state = {
+    year: new Date().getFullYear(),
+    month: new Date().getMonth(),
+    entries: {},
+    loans: [],
+    cats: { expense: [...DEFAULT_CATS.expense], income: [...DEFAULT_CATS.income] },
+    modal: null,
+    selectedDay: null,
+    addType: 'expense',
+    loansModal: false,
+    catsModal: false
+  };
+
+  // --- Firebase helpers ---
+  function dbRef(path) { return ref(db, `groups/${GROUP_ID}/${path}`); }
+
+  async function loadAll() {
+    const snap = await get(dbRef(''));
+    if (snap.exists()) {
+      const d = snap.val();
+      state.entries = d.entries || {};
+      state.loans   = d.loans   ? Object.values(d.loans) : [];
+      state.cats    = d.cats    || { expense: [...DEFAULT_CATS.expense], income: [...DEFAULT_CATS.income] };
+    }
+  }
+
+  function listenAll() {
+    onValue(dbRef(''), snap => {
+      if (snap.exists()) {
+        const d = snap.val();
+        state.entries = d.entries || {};
+        state.loans   = d.loans   ? Object.values(d.loans) : [];
+        state.cats    = d.cats    || { expense: [...DEFAULT_CATS.expense], income: [...DEFAULT_CATS.income] };
+        render();
+      }
+    });
+  }
+
+  async function saveEntries() { await set(dbRef('entries'), state.entries); }
+  async function saveLoans()   { await set(dbRef('loans'), state.loans.reduce((a,l,i)=>{a[i]=l;return a;},{})); }
+  async function saveCats()    { await set(dbRef('cats'), state.cats); }
+
+  // --- Helpers ---
+  function key(y,m,d) { return `${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`; }
+  function getDayEntries(y,m,d) { return state.entries[key(y,m,d)] || []; }
+  function fmt(n) { return new Intl.NumberFormat('ru-RU').format(Math.round(n)); }
+
+  function dayBalance(entries) {
+    let b = 0;
+    entries.forEach(e => {
+      if (e.type==='income'||e.type==='plan-in') b += e.amount;
+      else if (e.type==='expense'||e.type==='plan-out'||e.type==='credit') b -= e.amount;
+    });
+    return b;
+  }
+
+  function monthStats() {
+    const {year:y, month:m} = state;
+    let income=0, planIn=0, expense=0, planOut=0, credit=0;
+    const cats = {};
+    const days = new Date(y,m+1,0).getDate();
+    for (let d=1; d<=days; d++) {
+      getDayEntries(y,m,d).forEach(e => {
+        if (e.type==='income')   income  += e.amount;
+        else if (e.type==='plan-in')  planIn  += e.amount;
+        else if (e.type==='expense')  { expense += e.amount; cats[e.cat||'Другое'] = (cats[e.cat||'Другое']||0)+e.amount; }
+        else if (e.type==='plan-out') planOut += e.amount;
+        else if (e.type==='credit')   credit  += e.amount;
+      });
+    }
+    const totalIn = income+planIn, totalOut = expense+planOut+credit;
+    return { income, planIn, expense, planOut, credit, totalIn, totalOut, free: totalIn-totalOut, cats };
+  }
+
+  function upcomingReminders() {
+    const {year:y, month:m} = state;
+    const days = new Date(y,m+1,0).getDate();
+    const items = [];
+    for (let d=1; d<=days; d++)
+      getDayEntries(y,m,d).forEach(e => { if (e.type==='reminder') items.push({d, text:e.desc, amount:e.amount}); });
+    return items.sort((a,b)=>a.d-b.d).slice(0,8);
+  }
+
+  function todayReminders() {
+    const t = new Date();
+    if (t.getFullYear()!==state.year||t.getMonth()!==state.month) return [];
+    return getDayEntries(state.year,state.month,t.getDate()).filter(e=>e.type==='reminder');
+  }
+
+  // --- Render ---
+  function render() {
+    const {year:y, month:m} = state;
+    const today = new Date();
+    const firstDay = (new Date(y,m,1).getDay()+6)%7;
+    const daysInMonth = new Date(y,m+1,0).getDate();
+    const stats = monthStats();
+    const reminders = upcomingReminders();
+    const todayRem = todayReminders();
+    const creditPct = stats.totalIn>0 ? Math.round(stats.credit/stats.totalIn*100) : 0;
+
+    let cells = '';
+    for (let i=0; i<firstDay; i++) cells += `<div class="day-cell empty"></div>`;
+    for (let d=1; d<=daysInMonth; d++) {
+      const entries = getDayEntries(y,m,d);
+      const isToday = today.getFullYear()===y && today.getMonth()===m && today.getDate()===d;
+      const isSel   = state.selectedDay===d;
+      const types   = new Set(entries.map(e=>e.type));
+      let dots = '';
+      if (types.has('income'))   dots += `<span class="dot dot-income"></span>`;
+      if (types.has('plan-in'))  dots += `<span class="dot dot-plan-in"></span>`;
+      if (types.has('expense'))  dots += `<span class="dot dot-expense"></span>`;
+      if (types.has('plan-out')) dots += `<span class="dot dot-plan-out"></span>`;
+      if (types.has('credit'))   dots += `<span class="dot dot-credit"></span>`;
+      if (types.has('reminder')) dots += `<span class="dot dot-reminder"></span>`;
+      const bal = dayBalance(entries);
+      const sumHtml = entries.length ? `<div class="day-sum ${bal>=0?'pos':'neg'}">${bal>=0?'+':''}${fmt(bal)}</div>` : '';
+      cells += `<div class="day-cell${isToday?' today':''}${isSel?' selected':''}" onclick="openDay(${d})">
+        <div class="day-num">${d}</div>
+        <div class="day-dots">${dots}</div>${sumHtml}</div>`;
+    }
+
+    const catEntries = Object.entries(stats.cats).sort((a,b)=>b[1]-a[1]).slice(0,4);
+    const maxCat = catEntries.length ? catEntries[0][1] : 1;
+    const catBars = catEntries.length
+      ? catEntries.map(([n,v])=>`<div class="cat-row"><span class="cat-label">${n}</span><div class="cat-track"><div class="cat-fill" style="width:${Math.round(v/maxCat*100)}%"></div></div><span class="cat-val">${fmt(v)} ₽</span></div>`).join('')
+      : `<div class="no-item">Нет данных</div>`;
+
+    const remList = reminders.length
+      ? reminders.map(r=>`<div class="rem-item"><span class="rem-d">${r.d}</span><span class="rem-t">${r.text}</span>${r.amount?`<span class="rem-a">${fmt(r.amount)} ₽</span>`:''}</div>`).join('')
+      : `<div class="no-item">Нет напоминаний</div>`;
+
+    const loanList = state.loans.length
+      ? state.loans.map((l,i)=>{
+          const pct = Math.round((l.totalAmount-l.remaining)/l.totalAmount*100);
+          const estMonths = l.minPayment>0 ? Math.ceil(l.remaining/l.minPayment) : null;
+          return `<div class="loan-item">
+            <div class="loan-name">${l.name}<button class="del-btn" onclick="deleteLoan(${i})">×</button></div>
+            <div class="loan-bar"><div class="loan-fill" style="width:${pct}%"></div></div>
+            <div class="loan-meta"><span>Остаток: ${fmt(l.remaining)} ₽</span><span>${pct}% погашено</span></div>
+            <div class="loan-sub">Мин. платёж: <b>${fmt(l.minPayment)} ₽</b>${l.months?` · Срок: ${l.months} мес.`:''}${estMonths?` · ~${estMonths} мес. при мин.`:''}</div>
+          </div>`;
+        }).join('')
+      : `<div class="no-item">Кредиты не добавлены</div>`;
+
+    const banner = todayRem.length
+      ? `<div class="banner"><span>🔔</span><div><b>Сегодня оплатить:</b><br>${todayRem.map(r=>`${r.desc}${r.amount?' — '+fmt(r.amount)+' ₽':''}`).join('; ')}</div></div>` : '';
+
+    document.getElementById('root').innerHTML = `
+      ${banner}
+      <div class="top-bar">
+        <div class="nav">
+          <button onclick="prevMonth()">‹</button>
+          <span class="mtitle">${MONTHS_RU[m]} ${y}</span>
+          <button onclick="nextMonth()">›</button>
+        </div>
+        <div style="display:flex;gap:6px">
+          <button class="sm-btn" onclick="openCatsModal()">Категории</button>
+          <button class="sm-btn" onclick="openLoansModal()">Кредиты</button>
+        </div>
+      </div>
+
+      <div class="weekdays">${DAYS_RU.map(d=>`<div class="wd">${d}</div>`).join('')}</div>
+      <div class="days-grid">${cells}</div>
+
+      <div class="legend">
+        <span class="leg"><span class="dot dot-income"></span>Доход</span>
+        <span class="leg"><span class="dot dot-plan-in"></span>План+</span>
+        <span class="leg"><span class="dot dot-expense"></span>Расход</span>
+        <span class="leg"><span class="dot dot-plan-out"></span>План−</span>
+        <span class="leg"><span class="dot dot-credit"></span>Кредит</span>
+        <span class="leg"><span class="dot dot-reminder"></span>Напомн.</span>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat"><div class="sl">Доходы</div><div class="sv pos">${fmt(stats.totalIn)} ₽</div></div>
+        <div class="stat"><div class="sl">Расходы</div><div class="sv neg">${fmt(stats.totalOut)} ₽</div></div>
+        <div class="stat"><div class="sl">Кредиты</div><div class="sv warn">${fmt(stats.credit)} ₽</div></div>
+        <div class="stat"><div class="sl">На кредиты</div><div class="sv ${creditPct>40?'neg':'warn'}">${creditPct}%</div></div>
+      </div>
+      <div class="free-box">
+        <div class="fl">Свободных денег в месяце</div>
+        <div class="fv" style="color:${stats.free>=0?'var(--green)':'var(--red)'}">${stats.free>=0?'+':''}${fmt(stats.free)} ₽</div>
+      </div>
+
+      <div class="section-title">Топ расходов</div>
+      <div class="cat-bar">${catBars}</div>
+
+      <div class="section-title">Кредиты и долги</div>
+      <div class="loan-list">${loanList}</div>
+
+      <div class="section-title">Напоминания в этом месяце</div>
+      <div class="rem-list">${remList}</div>
+
+      ${state.modal!==null ? renderEntryModal() : ''}
+      ${state.loansModal  ? renderLoansModal()  : ''}
+      ${state.catsModal   ? renderCatsModal()   : ''}
+    `;
+  }
+
+  function renderEntryModal() {
+    const d = state.modal;
+    const {year:y, month:m} = state;
+    const entries = d!==null ? getDayEntries(y,m,d) : [];
+    const t = state.addType;
+    const catsForType = t==='expense'||t==='plan-out' ? state.cats.expense : t==='income'||t==='plan-in' ? state.cats.income : [];
+    const showCat = catsForType.length > 0;
+
+    const entryList = entries.length
+      ? entries.map((e,i)=>{
+          const lmap = {income:'Доход', expense:'Расход', credit:'Кредит', 'plan-in':'План+', 'plan-out':'План−', reminder:'Напомн.'};
+          return `<div class="e-item">
+            <span class="e-badge badge-${e.type}">${lmap[e.type]||e.type}</span>
+            <span class="e-desc">${e.desc||e.cat||'—'}</span>
+            <span class="e-amt">${e.amount?fmt(e.amount)+' ₽':''}</span>
+            <button class="del-btn" onclick="deleteEntry(${d},${i})">×</button>
+          </div>`;
+        }).join('')
+      : `<div class="no-item">Нет записей</div>`;
+
+    const dayLabel = d!==null ? `${d} ${MONTHS_RU[m]}` : 'Добавить';
+    return `<div class="modal-bg" onclick="closeModalBg(event)">
+      <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-title">${dayLabel}</div>
+        ${d===null?`<div class="form-row"><label>День</label><input type="number" id="inp-day" min="1" max="${new Date(y,m+1,0).getDate()}" value="${new Date().getDate()}"></div>`:''}
+        <div class="form-row"><label>Тип</label>
+          <select id="inp-type" onchange="changeType(this.value)">
+            <option value="income"  ${t==='income'  ?'selected':''}>Доход (факт)</option>
+            <option value="plan-in" ${t==='plan-in' ?'selected':''}>Плановый доход</option>
+            <option value="expense" ${t==='expense' ?'selected':''}>Расход (факт)</option>
+            <option value="plan-out"${t==='plan-out'?'selected':''}>Плановый расход</option>
+            <option value="credit"  ${t==='credit'  ?'selected':''}>Платёж по кредиту</option>
+            <option value="reminder"${t==='reminder'?'selected':''}>Напоминание</option>
+          </select>
+        </div>
+        ${showCat?`<div class="form-row"><label>Категория</label><select id="inp-cat">${catsForType.map(c=>`<option>${c}</option>`).join('')}</select></div>`:''}
+        <div class="form-row"><label>Описание</label><input type="text" id="inp-desc" placeholder="${t==='reminder'?'Что оплатить?':'Необязательно'}"></div>
+        <div class="form-row"><label>Сумма, ₽</label><input type="number" id="inp-amount" min="0" placeholder="0"></div>
+        ${['reminder','credit','plan-out','plan-in'].includes(t)?`<div class="form-row"><label><input type="checkbox" id="inp-repeat"> Повторять ежемесячно</label></div>`:''}
+        <button class="btn-primary" onclick="addEntry(${d})">+ Добавить</button>
+        <div class="sep"></div>
+        <div class="section-label">Записи дня</div>
+        <div class="e-list">${entryList}</div>
+        <button class="btn-ghost" onclick="closeModal()">Закрыть</button>
+      </div>
+    </div>`;
+  }
+
+  function renderLoansModal() {
+    const items = state.loans.length
+      ? state.loans.map((l,i)=>`<div class="loan-item">
+          <div class="loan-name">${l.name}<button class="del-btn" onclick="deleteLoan(${i})">×</button></div>
+          <div class="loan-sub">${fmt(l.totalAmount)} ₽ · Остаток ${fmt(l.remaining)} ₽ · Мин ${fmt(l.minPayment)} ₽${l.months?' · '+l.months+' мес.':''}</div>
+        </div>`).join('')
+      : `<div class="no-item">Пока нет</div>`;
+    return `<div class="modal-bg" onclick="closeLoansModalBg(event)">
+      <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-title">Кредиты и долги</div>
+        ${items}
+        <div class="sep"></div>
+        <div class="section-label">Добавить</div>
+        <div class="form-row"><label>Название</label><input type="text" id="l-name" placeholder="Ипотека, карта..."></div>
+        <div class="form-row"><label>Общая сумма, ₽</label><input type="number" id="l-total" placeholder="500000"></div>
+        <div class="form-row"><label>Текущий остаток, ₽</label><input type="number" id="l-remaining" placeholder="350000"></div>
+        <div class="form-row"><label>Мин. платёж, ₽/мес</label><input type="number" id="l-min" placeholder="5000"></div>
+        <div class="form-row"><label>Срок (мес.) — если знаете</label><input type="number" id="l-months" placeholder="необязательно"></div>
+        <div class="form-row"><label>Заметка</label><input type="text" id="l-note" placeholder="Непонятно как гасить..."></div>
+        <button class="btn-primary" onclick="addLoan()">+ Добавить кредит</button>
+        <button class="btn-ghost" onclick="closeLoansModal()">Закрыть</button>
+      </div>
+    </div>`;
+  }
+
+  function renderCatsModal() {
+    const expItems = state.cats.expense.map((c,i)=>`<div class="cat-item"><span>${c}</span><small>расход</small><button class="del-btn" onclick="deleteCat('expense',${i})">×</button></div>`).join('');
+    const incItems = state.cats.income.map((c,i)=>`<div class="cat-item"><span>${c}</span><small>доход</small><button class="del-btn" onclick="deleteCat('income',${i})">×</button></div>`).join('');
+    return `<div class="modal-bg" onclick="closeCatsModalBg(event)">
+      <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-title">Категории</div>
+        <div class="cats-list">${expItems}${incItems}</div>
+        <div class="sep"></div>
+        <div class="section-label">Добавить категорию</div>
+        <div class="form-row"><label>Название</label><input type="text" id="nc-name" placeholder="Новая категория"></div>
+        <div class="form-row"><label>Тип</label>
+          <select id="nc-type"><option value="expense">Расход</option><option value="income">Доход</option></select>
+        </div>
+        <button class="btn-primary" onclick="addCat()">+ Добавить</button>
+        <button class="btn-ghost" onclick="closeCatsModal()">Готово</button>
+      </div>
+    </div>`;
+  }
+
+  // --- Actions (global) ---
+  window.changeType = v => { state.addType=v; render(); };
+  window.openDay    = d => { state.modal=d; state.selectedDay=d; if(!state.addType) state.addType='expense'; render(); };
+  window.closeModal = ()  => { state.modal=null; render(); };
+  window.closeModalBg = e => { if(e.target===e.currentTarget) window.closeModal(); };
+  window.prevMonth = () => { state.month--; if(state.month<0){state.month=11;state.year--;} render(); };
+  window.nextMonth = () => { state.month++; if(state.month>11){state.month=0;state.year++;} render(); };
+  window.openLoansModal  = () => { state.loansModal=true;  render(); };
+  window.closeLoansModal = () => { state.loansModal=false; render(); };
+  window.closeLoansModalBg = e => { if(e.target===e.currentTarget) window.closeLoansModal(); };
+  window.openCatsModal   = () => { state.catsModal=true;  render(); };
+  window.closeCatsModal  = () => { state.catsModal=false; render(); };
+  window.closeCatsModalBg = e => { if(e.target===e.currentTarget) window.closeCatsModal(); };
+
+  window.addEntry = async (clickedDay) => {
+    const {year:y, month:m} = state;
+    const d = clickedDay!==null ? clickedDay : parseInt(document.getElementById('inp-day')?.value||new Date().getDate());
+    const type   = document.getElementById('inp-type').value;
+    const desc   = document.getElementById('inp-desc').value.trim();
+    const amount = parseFloat(document.getElementById('inp-amount').value)||0;
+    const cat    = document.getElementById('inp-cat')?.value||'';
+    const repeat = document.getElementById('inp-repeat')?.checked||false;
+    const k = key(y,m,d);
+    if (!state.entries[k]) state.entries[k]=[];
+    const entry = {type,desc,amount,cat};
+    state.entries[k].push(entry);
+    if (repeat) {
+      for (let mi=1; mi<=11; mi++) {
+        let nm=m+mi, ny=y; if(nm>11){nm-=12;ny++;}
+        const rk = key(ny,nm,d);
+        if(!state.entries[rk]) state.entries[rk]=[];
+        state.entries[rk].push({...entry});
+      }
+    }
+    await saveEntries();
+  };
+
+  window.deleteEntry = async (d, i) => {
+    const {year:y, month:m} = state;
+    const k = key(y,m,d);
+    if (state.entries[k]) {
+      state.entries[k].splice(i,1);
+      if (!state.entries[k].length) delete state.entries[k];
+      await saveEntries();
+    }
+  };
+
+  window.addLoan = async () => {
+    const name        = document.getElementById('l-name').value.trim();
+    const totalAmount = parseFloat(document.getElementById('l-total').value)||0;
+    const remaining   = parseFloat(document.getElementById('l-remaining').value)||totalAmount;
+    const minPayment  = parseFloat(document.getElementById('l-min').value)||0;
+    const months      = parseInt(document.getElementById('l-months').value)||null;
+    const note        = document.getElementById('l-note').value.trim();
+    if (!name||!totalAmount) return;
+    state.loans.push({name,totalAmount,remaining,minPayment,months,note});
+    await saveLoans();
+  };
+
+  window.deleteLoan = async i => {
+    state.loans.splice(i,1);
+    await saveLoans();
+  };
+
+  window.addCat = async () => {
+    const name = document.getElementById('nc-name').value.trim();
+    const type = document.getElementById('nc-type').value;
+    if (!name) return;
+    if (!state.cats[type].includes(name)) state.cats[type].push(name);
+    await saveCats();
+  };
+
+  window.deleteCat = async (type, i) => {
+    if (DEFAULT_CATS[type]?.includes(state.cats[type][i])) return;
+    state.cats[type].splice(i,1);
+    await saveCats();
+  };
+
+  // --- Boot ---
+  loadAll().then(() => { listenAll(); render(); });
+</script>
+
+<style>
+:root {
+  --bg:    #ffffff;
+  --bg2:   #f4f4f5;
+  --bg3:   #e8e8ea;
+  --text:  #111111;
+  --text2: #666666;
+  --text3: #999999;
+  --border:#dddddd;
+  --green: #2e7d32;
+  --red:   #c62828;
+  --blue:  #1565c0;
+  --amber: #e65100;
+  --radius:10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root{--bg:#1c1c1e;--bg2:#2c2c2e;--bg3:#3a3a3c;--text:#f2f2f7;--text2:#aeaeb2;--text3:#636366;--border:#38383a;}
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+body { font-family: -apple-system, 'Helvetica Neue', sans-serif; background:var(--bg); color:var(--text); font-size:14px; padding:12px; }
+button { font-family:inherit; cursor:pointer; }
+input, select { font-family:inherit; background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:8px 10px; color:var(--text); font-size:14px; width:100%; }
+select { appearance:none; }
+
+.top-bar { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+.nav { display:flex; align-items:center; gap:8px; }
+.nav button { background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:4px 12px; font-size:18px; color:var(--text); }
+.mtitle { font-size:16px; font-weight:600; }
+.sm-btn { background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:5px 10px; font-size:12px; color:var(--text2); }
+
+.weekdays { display:grid; grid-template-columns:repeat(7,1fr); gap:2px; margin-bottom:3px; }
+.wd { text-align:center; font-size:11px; color:var(--text3); padding:3px 0; }
+.days-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:2px; }
+.day-cell { min-height:58px; border:1px solid var(--border); border-radius:8px; padding:4px; cursor:pointer; background:var(--bg); }
+.day-cell:active { background:var(--bg2); }
+.day-cell.empty { background:none; border-color:transparent; cursor:default; }
+.day-cell.today { border-color:#1976d2; border-width:2px; }
+.day-cell.selected { border-color:#388e3c; border-width:2px; }
+.day-num { font-size:11px; font-weight:600; color:var(--text2); }
+.day-cell.today .day-num { color:#1565c0; }
+.day-dots { display:flex; flex-wrap:wrap; gap:2px; margin-top:2px; }
+.dot { width:5px; height:5px; border-radius:50%; }
+.dot-income{background:#388e3c} .dot-expense{background:#c62828} .dot-credit{background:#1565c0}
+.dot-reminder{background:#e65100} .dot-plan-in{background:#66bb6a;opacity:.8} .dot-plan-out{background:#ef9a9a;opacity:.8}
+.day-sum { font-size:9px; font-weight:600; margin-top:2px; }
+.day-sum.pos{color:#2e7d32} .day-sum.neg{color:#c62828}
+
+.legend { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; margin-bottom:12px; }
+.leg { display:flex; align-items:center; gap:3px; font-size:10px; color:var(--text3); }
+
+.stats-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:8px; }
+.stat { background:var(--bg2); border-radius:10px; padding:10px 12px; }
+.sl { font-size:11px; color:var(--text3); margin-bottom:3px; }
+.sv { font-size:16px; font-weight:600; }
+.sv.pos{color:#2e7d32} .sv.neg{color:#c62828} .sv.warn{color:#e65100}
+
+.free-box { background:var(--bg2); border-radius:10px; padding:10px 14px; margin-bottom:14px; }
+.fl { font-size:11px; color:var(--text3); margin-bottom:3px; }
+.fv { font-size:22px; font-weight:700; }
+
+.section-title { font-size:13px; font-weight:600; color:var(--text2); margin-bottom:6px; margin-top:12px; }
+
+.cat-bar { margin-bottom:12px; }
+.cat-row { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+.cat-label { font-size:12px; color:var(--text2); width:80px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cat-track { flex:1; height:5px; background:var(--bg3); border-radius:3px; overflow:hidden; }
+.cat-fill { height:100%; background:#c62828; border-radius:3px; }
+.cat-val { font-size:11px; color:var(--text3); min-width:58px; text-align:right; }
+
+.loan-list, .rem-list { display:flex; flex-direction:column; gap:6px; margin-bottom:4px; }
+.loan-item { background:var(--bg2); border-radius:10px; padding:10px 12px; }
+.loan-name { font-weight:600; font-size:13px; display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }
+.loan-bar { height:5px; background:var(--bg3); border-radius:3px; overflow:hidden; margin:5px 0; }
+.loan-fill { height:100%; background:#1565c0; border-radius:3px; }
+.loan-meta { display:flex; justify-content:space-between; font-size:11px; color:var(--text3); }
+.loan-sub { font-size:11px; color:var(--text3); margin-top:3px; }
+.loan-sub b { color:var(--red); }
+.rem-item { display:flex; align-items:center; gap:8px; background:var(--bg2); border-radius:10px; padding:8px 12px; font-size:12px; }
+.rem-d { color:var(--text3); min-width:24px; font-weight:600; }
+.rem-t { flex:1; }
+.rem-a { font-weight:600; color:var(--red); white-space:nowrap; }
+.no-item { font-size:12px; color:var(--text3); text-align:center; padding:10px 0; }
+
+.banner { background:#fff3e0; border:1px solid #ff9800; border-radius:10px; padding:10px 12px; font-size:13px; color:#e65100; margin-bottom:12px; display:flex; gap:8px; }
+
+.modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:flex-end; z-index:100; }
+.modal { background:var(--bg); border-radius:16px 16px 0 0; padding:16px; width:100%; max-height:85vh; overflow-y:auto; }
+.modal-title { font-size:16px; font-weight:600; margin-bottom:14px; }
+.form-row { margin-bottom:10px; }
+.form-row label { font-size:12px; color:var(--text2); display:block; margin-bottom:4px; }
+.section-label { font-size:12px; font-weight:600; color:var(--text2); margin-bottom:8px; }
+.sep { border-top:1px solid var(--border); margin:14px 0 12px; }
+.btn-primary { width:100%; padding:12px; background:#1976d2; color:#fff; border:none; border-radius:10px; font-size:15px; font-weight:600; margin-bottom:8px; }
+.btn-ghost { width:100%; padding:10px; background:var(--bg2); color:var(--text2); border:1px solid var(--border); border-radius:10px; font-size:14px; }
+.del-btn { background:none; border:none; color:var(--text3); font-size:18px; cursor:pointer; padding:0; line-height:1; }
+.del-btn:active { color:var(--red); }
+
+.e-list { display:flex; flex-direction:column; gap:6px; max-height:180px; overflow-y:auto; margin-bottom:12px; }
+.e-item { display:flex; align-items:center; gap:8px; padding:7px 10px; background:var(--bg2); border-radius:8px; font-size:12px; }
+.e-badge { font-size:10px; padding:2px 7px; border-radius:10px; font-weight:600; white-space:nowrap; }
+.badge-income{background:#e8f5e9;color:#2e7d32} .badge-expense{background:#ffebee;color:#c62828}
+.badge-credit{background:#e3f2fd;color:#1565c0} .badge-plan-in{background:#c8e6c9;color:#1b5e20}
+.badge-plan-out{background:#ffcdd2;color:#b71c1c} .badge-reminder{background:#fff3e0;color:#e65100}
+.e-desc { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.e-amt { font-weight:600; white-space:nowrap; }
+
+.cats-list { display:flex; flex-direction:column; gap:5px; max-height:180px; overflow-y:auto; margin-bottom:8px; }
+.cat-item { display:flex; align-items:center; gap:8px; padding:7px 10px; background:var(--bg2); border-radius:8px; font-size:13px; }
+.cat-item span { flex:1; }
+.cat-item small { color:var(--text3); font-size:10px; }
+</style>
+
+<body>
+  <div id="root"></div>
+</body>
+</html>
